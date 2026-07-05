@@ -45,6 +45,24 @@ Two triggers keep the playlist current:
 
 A failed rebuild (provider down, etc.) never replaces the last good playlist.
 
+## Styled mode (curated look, your streams)
+
+Set `PLAYLIST_STYLE=ganja` to render the playlist in the look of a curated
+EPGenius template (channel names, logos, groups, ordering, EPG ids) while
+sourcing every stream from your own provider. Template entries are matched to
+provider streams with precision-first rules (EPG id, exact normalized name
+with region preference, US broadcast callsign) — never fuzzy matching, so a
+styled channel is always the channel it claims to be. Unmatched template
+entries are dropped; provider channels the template doesn't use are appended
+in their native groups.
+
+With `EPG_MERGE=on` (default) and `PUBLIC_BASE_URL` set, `/epg.xml` serves a
+merged, filtered guide (template EPG + provider EPG, only referenced
+channels, gzip-encoded) so one guide URL covers the whole playlist.
+
+Extra styled-mode variables: `PLAYLIST_STYLE`, `TEMPLATE_URL`, `TEMPLATE_ID`,
+`TEMPLATE_EPG_URL`, `EPG_MERGE`, `EPG_REFRESH_HOURS`, `PUBLIC_BASE_URL`.
+
 ## Configuration (environment variables)
 
 | Variable                 | Default                     | Meaning                                    |
