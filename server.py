@@ -79,6 +79,7 @@ state = {
     "groups": 0,
     "styled": 0,
     "appendix": 0,
+    "sources": 0,
     "refreshes": 0,
     "last_error": None,
     "refreshing": False,
@@ -159,6 +160,12 @@ def quality_score(name):
 
 
 QUALITY_MAX = dict(QUALITY_TIERS).get(QUALITY_CAP, 99) if QUALITY_CAP else 99
+
+# Emit up to MULTI_STREAM_MAX source variants per styled channel under the
+# same name/tvg-id. Players that group by name (e.g. UHF Smart Playlists)
+# show them as one channel with switchable backup sources, best first.
+MULTI_STREAM = os.environ.get("MULTI_STREAM", "off") == "on"
+MULTI_STREAM_MAX = max(1, int(os.environ.get("MULTI_STREAM_MAX", "3")))
 NETWORK_WORDS = {"nbc", "abc", "cbs", "fox", "cw", "pbs", "metv",
                  "telemundo", "univision", "mytv", "my"}
 
@@ -210,29 +217,33 @@ class Matcher:
                     self.by_callsign[tok].append(s)
 
     @staticmethod
-    def pick(cands, want_region):
-        """Prefer the wanted region (VIP premium feeds count as any region),
-        then the highest quality label within it, capped by QUALITY_CAP."""
-        def best(pool):
-            pool = [s for s in pool
-                    if quality_score(s.get("name")) <= QUALITY_MAX] or pool
-            return max(pool, key=lambda s: quality_score(s.get("name")))
-
+    def ranked(cands, want_region):
+        """Region-correct candidates (VIP premium feeds count as any region),
+        highest quality label first, capped by QUALITY_CAP, unique streams."""
+        pool = cands
         for want in (want_region, "us"):
             hits = [s for s in cands
                     if provider_region(s.get("name")) in (want, "vip")]
             if hits:
-                return best(hits)
-        return best(cands)
+                pool = hits
+                break
+        capped = [s for s in pool
+                  if quality_score(s.get("name")) <= QUALITY_MAX] or pool
+        out, seen = [], set()
+        for s in sorted(capped, key=lambda s: -quality_score(s.get("name"))):
+            if s["stream_id"] not in seen:
+                seen.add(s["stream_id"])
+                out.append(s)
+        return out
 
-    def resolve(self, tvg_id, display_name, group):
+    def resolve_all(self, tvg_id, display_name, group):
         want = group_region(group)
         tid = (tvg_id or "").strip().lower()
         if tid and tid in self.by_epg:
-            return self.pick(self.by_epg[tid], want)
+            return self.ranked(self.by_epg[tid], want)
         nn = norm_name(display_name)
         if nn and nn in self.by_name:
-            return self.pick(self.by_name[nn], want)
+            return self.ranked(self.by_name[nn], want)
         cs = callsign_of(tvg_id)
         if cs and cs in self.by_callsign:
             nets = {w for w in nn.split() if w in NETWORK_WORDS}
@@ -240,8 +251,8 @@ class Matcher:
                      if provider_region(c.get("name")) == "us"
                      and (not nets or nets & set(norm_name(c.get("name")).split()))]
             if cands:
-                return self.pick(cands, "us")
-        return None
+                return self.ranked(cands, "us")
+        return []
 
 
 # --- template ----------------------------------------------------------------
@@ -309,7 +320,7 @@ def build_native(categories, streams):
                 f' tvg-logo="{clean(s.get("stream_icon"))}" group-title="{cname}",{name}')
             lines.append(stream_url(s["stream_id"]))
             total += 1
-    return lines, total, len(kept), 0, total, refs
+    return lines, total, len(kept), 0, total, total, refs
 
 
 def build_ganja(categories, streams):
@@ -332,13 +343,17 @@ def build_ganja(categories, streams):
     consumed = set()
     styled = 0
     groups = set()
+    sources = 0
     for ext, tid, name, grp in entries:
-        s = matcher.resolve(tid, name, grp)
-        if s is None:
+        matches = matcher.resolve_all(tid, name, grp)
+        if not matches:
             continue
-        lines.append(ext)
-        lines.append(stream_url(s["stream_id"]))
-        consumed.add(s["stream_id"])
+        take = matches[:MULTI_STREAM_MAX] if MULTI_STREAM else matches[:1]
+        for s in take:
+            lines.append(ext)
+            lines.append(stream_url(s["stream_id"]))
+            consumed.add(s["stream_id"])
+            sources += 1
         if tid.strip():
             refs.add(tid.strip())
         groups.add(grp)
@@ -369,19 +384,19 @@ def build_ganja(categories, streams):
 
     if styled == 0:
         raise RuntimeError("styled build matched zero channels")
-    return lines, styled + appendix, len(groups), styled, appendix, refs
+    return lines, styled + appendix, len(groups), styled, appendix, sources + appendix, refs
 
 
 def build_playlist():
     categories = api("get_live_categories")
     streams = api("get_live_streams")
     if PLAYLIST_STYLE == "ganja":
-        lines, total, groups, styled, appendix, refs = build_ganja(categories, streams)
+        lines, total, groups, styled, appendix, sources, refs = build_ganja(categories, streams)
     else:
-        lines, total, groups, styled, appendix, refs = build_native(categories, streams)
+        lines, total, groups, styled, appendix, sources, refs = build_native(categories, streams)
     if total == 0:
         raise RuntimeError("provider returned no channels for the configured groups")
-    return "\n".join(lines).encode("utf-8") + b"\n", total, groups, styled, appendix, refs
+    return "\n".join(lines).encode("utf-8") + b"\n", total, groups, styled, appendix, sources, refs
 
 
 # --- merged EPG ----------------------------------------------------------------
@@ -488,11 +503,12 @@ def epg_stale():
 
 def refresh():
     try:
-        playlist, channels, groups, styled, appendix, refs = build_playlist()
+        playlist, channels, groups, styled, appendix, sources, refs = build_playlist()
         with state["lock"]:
             state.update(playlist=playlist, generated_at=time.time(),
                          channels=channels, groups=groups, styled=styled,
-                         appendix=appendix, last_error=None, epg_refs=refs)
+                         appendix=appendix, sources=sources,
+                         last_error=None, epg_refs=refs)
             state["refreshes"] += 1
         print(f"refreshed: {channels} channels ({styled} styled + {appendix} "
               f"appendix) in {groups} groups", flush=True)
@@ -597,6 +613,7 @@ class Handler(BaseHTTPRequestHandler):
                     "channels": state["channels"],
                     "styled": state["styled"],
                     "appendix": state["appendix"],
+                    "sources": state["sources"],
                     "groups": state["groups"],
                     "refreshes": state["refreshes"],
                     "refreshing": state["refreshing"],
