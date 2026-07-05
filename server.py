@@ -178,7 +178,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
-        if not self.authorized(query):
+        # /status is always reachable so container healthchecks and liveness
+        # probes work without the token; it exposes no credentials. Every
+        # other endpoint requires the token when one is configured.
+        if parsed.path != "/status" and not self.authorized(query):
             return self.send(403, b"missing or wrong token")
 
         if parsed.path in ("/playlist.m3u", "/playlist"):
