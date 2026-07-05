@@ -137,6 +137,28 @@ def stream_url(stream_id):
 
 QUALITY_WORDS = set(
     "fhd uhd hd sd 4k 8k 1080p 1080i 720p 576p 480p raw vip the tv channel ch".split())
+
+# Quality tiers readable from provider channel names, best first. Bitrate is
+# not exposed by the Xtream API, so the provider's own labels are the signal.
+QUALITY_TIERS = [
+    ("8k", 7), ("uhd", 6), ("4k", 6), ("fhd", 5), ("1080", 5),
+    ("hd", 4), ("720", 3),
+]
+QUALITY_CAP = os.environ.get("QUALITY_CAP", "").lower()  # e.g. "fhd" to skip 4K/8K
+
+
+def quality_score(name):
+    n = f" {(name or '').lower()} "
+    n = re.sub(r"[^a-z0-9]", " ", n)
+    for word, score in QUALITY_TIERS:
+        if f" {word} " in n:
+            return score
+    if " sd " in n or " 576 " in n or " 480 " in n:
+        return 1
+    return 2  # unmarked: assume between SD and HD
+
+
+QUALITY_MAX = dict(QUALITY_TIERS).get(QUALITY_CAP, 99) if QUALITY_CAP else 99
 NETWORK_WORDS = {"nbc", "abc", "cbs", "fox", "cw", "pbs", "metv",
                  "telemundo", "univision", "mytv", "my"}
 
@@ -189,11 +211,19 @@ class Matcher:
 
     @staticmethod
     def pick(cands, want_region):
+        """Prefer the wanted region (VIP premium feeds count as any region),
+        then the highest quality label within it, capped by QUALITY_CAP."""
+        def best(pool):
+            pool = [s for s in pool
+                    if quality_score(s.get("name")) <= QUALITY_MAX] or pool
+            return max(pool, key=lambda s: quality_score(s.get("name")))
+
         for want in (want_region, "us"):
-            hits = [s for s in cands if provider_region(s.get("name")) == want]
+            hits = [s for s in cands
+                    if provider_region(s.get("name")) in (want, "vip")]
             if hits:
-                return hits[0]
-        return cands[0]
+                return best(hits)
+        return best(cands)
 
     def resolve(self, tvg_id, display_name, group):
         want = group_region(group)
@@ -210,7 +240,7 @@ class Matcher:
                      if provider_region(c.get("name")) == "us"
                      and (not nets or nets & set(norm_name(c.get("name")).split()))]
             if cands:
-                return cands[0]
+                return self.pick(cands, "us")
         return None
 
 
