@@ -200,11 +200,19 @@ def group_region(group):
     return "us"
 
 
+US_LOCAL_NETS = {"nbc", "cbs", "abc", "fox", "cw", "pbs", "metv",
+                 "telemundo", "univision", "mytv"}
+# A local-affiliate candidate may not introduce these words unless the
+# template entry has them too (stops NBC Chicago -> NBC SPORTS Chicago).
+LOCAL_REJECT_WORDS = {"sports", "news", "deportes"}
+
+
 class Matcher:
     def __init__(self, streams):
         self.by_epg = defaultdict(list)
         self.by_name = defaultdict(list)
         self.by_callsign = defaultdict(list)
+        self.by_net_us = defaultdict(list)
         for s in streams:
             eid = (s.get("epg_channel_id") or "").strip().lower()
             if eid:
@@ -212,9 +220,13 @@ class Matcher:
             nn = norm_name(s.get("name"))
             if nn:
                 self.by_name[nn].append(s)
-            for tok in nn.split():
+            toks = set(nn.split())
+            for tok in toks:
                 if re.match(r"^[kw][a-z]{2,4}$", tok):
                     self.by_callsign[tok].append(s)
+            if provider_region(s.get("name")) == "us":
+                for net in toks & US_LOCAL_NETS:
+                    self.by_net_us[net].append((toks, s))
 
     @staticmethod
     def ranked(cands, want_region):
@@ -236,6 +248,38 @@ class Matcher:
                 out.append(s)
         return out
 
+    def resolve_local(self, tvg_id, display_name):
+        """US local affiliates: network word + city tokens, digits must
+        agree, callsign hit picks the exact station."""
+        toks = set(norm_name(display_name).split())
+        nets = toks & US_LOCAL_NETS
+        if not nets:
+            return []
+        digits = {t for t in toks if t.isdigit()}
+        city = [t for t in toks
+                if t not in US_LOCAL_NETS and not t.isdigit()
+                and len(t) >= 4 and t not in LOCAL_REJECT_WORDS]
+        cs = callsign_of(tvg_id)
+        exact, near = [], []
+        for net in nets:
+            for stoks, s in self.by_net_us[net]:
+                if cs and cs in stoks:
+                    exact.append(s)
+                    continue
+                if not city or not all(c in stoks for c in city):
+                    continue
+                if digits and not digits <= stoks:
+                    continue
+                if (stoks & LOCAL_REJECT_WORDS) - toks:
+                    continue
+                near.append(s)
+        out, seen = [], set()
+        for s in exact + self.ranked(near, "us"):
+            if s["stream_id"] not in seen:
+                seen.add(s["stream_id"])
+                out.append(s)
+        return out
+
     def resolve_all(self, tvg_id, display_name, group):
         want = group_region(group)
         tid = (tvg_id or "").strip().lower()
@@ -244,6 +288,10 @@ class Matcher:
         nn = norm_name(display_name)
         if nn and nn in self.by_name:
             return self.ranked(self.by_name[nn], want)
+        if want == "us":
+            local = self.resolve_local(tvg_id, display_name)
+            if local:
+                return local
         cs = callsign_of(tvg_id)
         if cs and cs in self.by_callsign:
             nets = {w for w in nn.split() if w in NETWORK_WORDS}
@@ -360,11 +408,28 @@ def build_ganja(categories, streams):
     groups = set()
     sources = 0
     chno = 0
+    resolved = []  # (ext, take, tid, grp) — take=None marks a separator
     for ext, tid, name, grp in entries:
+        if "###" in name:
+            resolved.append((ext, None, tid, grp))
+            continue
         matches = matcher.resolve_all(tid, name, grp)
         if not matches:
             continue
         take = matches[:MULTI_STREAM_MAX] if MULTI_STREAM else matches[:1]
+        resolved.append((ext, take, tid, grp))
+    # separators are decorative: keep them whenever their section kept any
+    # channel, pointing at the next real stream so a click plays something
+    next_stream = None
+    for idx in range(len(resolved) - 1, -1, -1):
+        ext, take, tid, grp = resolved[idx]
+        if take is None:
+            resolved[idx] = (ext, next_stream, tid, grp)
+        elif take:
+            next_stream = [take[0]]
+    for ext, take, tid, grp in resolved:
+        if not take:
+            continue
         chno += 1
         for s in take:
             lines.append(with_chno(ext, chno))
