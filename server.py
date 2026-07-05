@@ -289,6 +289,19 @@ def parse_template(text):
 
 # --- playlist builders ---------------------------------------------------------
 
+
+CHNO_RE = re.compile(r'\s*tvg-chno="[^"]*"')
+
+
+def with_chno(extinf, number):
+    """Strip any existing tvg-chno (templates carry broken tvg-chno="null")
+    and stamp an explicit sequential one so players that sort by channel
+    number reproduce the intended playlist order."""
+    ext = CHNO_RE.sub("", extinf)
+    head, sep, rest = ext.partition(" ")
+    return f'{head} tvg-chno="{number}"{sep}{rest}' if sep else ext
+
+
 def epg_url_for_header():
     if EPG_MERGE and PUBLIC_BASE_URL:
         tok = f"?token={TOKEN}" if TOKEN else ""
@@ -308,6 +321,7 @@ def build_native(categories, streams):
     lines = [f'#EXTM3U url-tvg="{epg_url_for_header()}"']
     refs = set()
     total = 0
+    chno = 0
     for c in kept:
         cname = c["category_name"]
         for s in by_cat.get(str(c["category_id"]), []):
@@ -315,8 +329,9 @@ def build_native(categories, streams):
             eid = clean(s.get("epg_channel_id"))
             if eid:
                 refs.add(eid)
+            chno += 1
             lines.append(
-                f'#EXTINF:-1 tvg-id="{eid}" tvg-name="{name}"'
+                f'#EXTINF:-1 tvg-chno="{chno}" tvg-id="{eid}" tvg-name="{name}"'
                 f' tvg-logo="{clean(s.get("stream_icon"))}" group-title="{cname}",{name}')
             lines.append(stream_url(s["stream_id"]))
             total += 1
@@ -344,13 +359,15 @@ def build_ganja(categories, streams):
     styled = 0
     groups = set()
     sources = 0
+    chno = 0
     for ext, tid, name, grp in entries:
         matches = matcher.resolve_all(tid, name, grp)
         if not matches:
             continue
         take = matches[:MULTI_STREAM_MAX] if MULTI_STREAM else matches[:1]
+        chno += 1
         for s in take:
-            lines.append(ext)
+            lines.append(with_chno(ext, chno))
             lines.append(stream_url(s["stream_id"]))
             consumed.add(s["stream_id"])
             sources += 1
@@ -375,8 +392,9 @@ def build_ganja(categories, streams):
             eid = clean(s.get("epg_channel_id"))
             if eid:
                 refs.add(eid)
+            chno += 1
             lines.append(
-                f'#EXTINF:-1 tvg-id="{eid}" tvg-name="{name}"'
+                f'#EXTINF:-1 tvg-chno="{chno}" tvg-id="{eid}" tvg-name="{name}"'
                 f' tvg-logo="{clean(s.get("stream_icon"))}" group-title="{cname}",{name}')
             lines.append(stream_url(s["stream_id"]))
             appendix += 1
