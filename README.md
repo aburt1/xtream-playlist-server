@@ -54,8 +54,8 @@ channel your account can actually play.
 ## Quickstart (Docker)
 
 ```sh
-git clone https://github.com/aburt1/xtream-playlist-server
-cd xtream-playlist-server
+git clone https://github.com/aburt1/strong8k-epgenius-bridge
+cd strong8k-epgenius-bridge
 cp .env.example .env    # fill in your provider details
 docker compose up -d --build
 ```
