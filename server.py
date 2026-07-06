@@ -51,9 +51,9 @@ STREAM_EXT = os.environ.get("STREAM_EXT", "ts")
 PLAYLIST_STYLE = os.environ.get("PLAYLIST_STYLE", "native")  # native | ganja
 TEMPLATE_URL = os.environ.get("TEMPLATE_URL", "https://epgenius.org/api/public/manual")
 TEMPLATE_ID = int(os.environ.get("TEMPLATE_ID", "6"))
-TEMPLATE_EPG_URL = os.environ.get("TEMPLATE_EPG_URL") or (
-    "https://github.com/ferteque/Curated-M3U-Repository/raw/refs/heads/main/"
-    f"epg{TEMPLATE_ID}.xml.gz")
+TEMPLATE_EPG_URL_ENV = os.environ.get("TEMPLATE_EPG_URL", "")
+TEMPLATES_LIST_URL = os.environ.get(
+    "TEMPLATES_LIST_URL", "https://epgenius.org/api/public/playlists")
 EPG_MERGE = os.environ.get("EPG_MERGE", "on") == "on"
 EPG_REFRESH_HOURS = float(os.environ.get("EPG_REFRESH_HOURS", "24"))
 # Base URL clients use to reach this server, for the playlist's url-tvg.
@@ -86,6 +86,8 @@ state = {
     "refreshing": False,
     "refresh_event": None,
     "template_text": None,        # last good template
+    "templates": None,            # EPGenius playlist catalog (cached)
+    "template_info": None,        # catalog entry for TEMPLATE_ID
     "epg_refs": set(),            # tvg-ids the playlist references
     "epg_built_at": None,
     "epg_refreshing": False,
@@ -326,6 +328,41 @@ class Matcher:
 
 # --- template ----------------------------------------------------------------
 
+def fetch_templates_list():
+    with http_get(TEMPLATES_LIST_URL, timeout=60) as resp:
+        listing = json.load(resp)
+    if not isinstance(listing, list):
+        raise RuntimeError("unexpected templates list response")
+    return listing
+
+
+def load_template_info():
+    """Refresh the EPGenius catalog and remember our template's entry."""
+    try:
+        listing = fetch_templates_list()
+        with state["lock"]:
+            state["templates"] = listing
+    except Exception as exc:
+        print(f"templates list fetch failed: {exc}", flush=True)
+        with state["lock"]:
+            listing = state["templates"] or []
+    info = next((p for p in listing
+                 if str(p.get("id")) == str(TEMPLATE_ID)), None)
+    with state["lock"]:
+        state["template_info"] = info
+
+
+def template_epg_url():
+    if TEMPLATE_EPG_URL_ENV:
+        return TEMPLATE_EPG_URL_ENV
+    with state["lock"]:
+        info = state["template_info"]
+    if info and info.get("github_epg_url"):
+        return info["github_epg_url"]
+    return ("https://github.com/ferteque/Curated-M3U-Repository/raw/"
+            f"refs/heads/main/epg{TEMPLATE_ID}.xml.gz")
+
+
 def fetch_template():
     if "/api/public/manual" in TEMPLATE_URL:
         body = json.dumps({"id": TEMPLATE_ID}).encode()
@@ -380,7 +417,7 @@ def epg_url_for_header():
         tok = f"?token={TOKEN}" if TOKEN else ""
         return f"{PUBLIC_BASE_URL}/epg.xml{tok}"
     if PLAYLIST_STYLE == "ganja":
-        return f"{TEMPLATE_EPG_URL},{PROVIDER_EPG_URL}"
+        return f"{template_epg_url()},{PROVIDER_EPG_URL}"
     return PROVIDER_EPG_URL
 
 
@@ -412,6 +449,7 @@ def build_native(categories, streams):
 
 
 def build_ganja(categories, streams):
+    load_template_info()
     try:
         template_text = with_retries(fetch_template, "template fetch")
         with state["lock"]:
@@ -553,7 +591,7 @@ def build_merged_epg(refs):
 
         # template EPG (gzipped over http)
         try:
-            with http_get(TEMPLATE_EPG_URL, timeout=600) as resp:
+            with http_get(template_epg_url(), timeout=600) as resp:
                 consume(gzip.GzipFile(fileobj=resp))
         except Exception as exc:
             print(f"template EPG fetch failed: {exc}", flush=True)
@@ -710,6 +748,27 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if parsed.path == "/templates":
+            with state["lock"]:
+                listing = state["templates"]
+            if listing is None:
+                try:
+                    listing = fetch_templates_list()
+                    with state["lock"]:
+                        state["templates"] = listing
+                except Exception as exc:
+                    return self.send(502, f"catalog unavailable: {exc}".encode())
+            rows = [{"id": p.get("id"), "curator": p.get("owner"),
+                     "provider": p.get("service_name"),
+                     "countries": p.get("countries"),
+                     "categories": p.get("main_categories"),
+                     "updated": p.get("timestamp")} for p in listing]
+            active = next((r for r in rows
+                           if str(r["id"]) == str(TEMPLATE_ID)), None)
+            body = json.dumps({"active_template": active,
+                               "available": rows}, indent=2).encode()
+            return self.send(200, body, "application/json")
+
         if parsed.path == "/refresh":
             refresh_async()
             return self.send(202, b"refresh started")
@@ -720,8 +779,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/status":
             with state["lock"]:
+                info = state["template_info"]
                 body = json.dumps({
                     "style": PLAYLIST_STYLE,
+                    "template": (f"{info.get('owner')} | "
+                                 f"{info.get('service_name')} "
+                                 f"(id {info.get('id')}, "
+                                 f"updated {info.get('timestamp')})")
+                    if info else None,
                     "channels": state["channels"],
                     "styled": state["styled"],
                     "appendix": state["appendix"],
