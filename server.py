@@ -102,11 +102,26 @@ def http_get(url, timeout=90, data=None, headers=None):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def with_retries(fn, what, attempts=3, delay=15):
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            if i == attempts - 1:
+                raise RuntimeError(f"{what}: {exc}") from exc
+            print(f"{what} failed (attempt {i + 1}/{attempts}): {exc}; "
+                  f"retrying in {delay}s", flush=True)
+            time.sleep(delay)
+
+
 def api(action):
     qs = urllib.parse.urlencode(
         {"username": USERNAME, "password": PASSWORD, "action": action})
-    with http_get(f"{HOST}/player_api.php?{qs}") as resp:
-        return json.load(resp)
+
+    def call():
+        with http_get(f"{HOST}/player_api.php?{qs}") as resp:
+            return json.load(resp)
+    return with_retries(call, f"provider {action}")
 
 
 # --- provider category selection (native mode + appendix) -------------------
@@ -398,14 +413,16 @@ def build_native(categories, streams):
 
 def build_ganja(categories, streams):
     try:
-        template_text = fetch_template()
+        template_text = with_retries(fetch_template, "template fetch")
         with state["lock"]:
             state["template_text"] = template_text
     except Exception as exc:
         with state["lock"]:
             template_text = state["template_text"]
         if not template_text:
-            raise RuntimeError(f"template fetch failed and no cache: {exc}")
+            print(f"template unavailable, serving native layout: {exc}",
+                  flush=True)
+            return build_native(categories, streams)
         print(f"template fetch failed, using cached copy: {exc}", flush=True)
 
     entries = parse_template(template_text)
@@ -636,7 +653,9 @@ def refresh_async():
 def refresh_loop():
     while True:
         refresh_async().wait()
-        time.sleep(REFRESH_HOURS * 3600)
+        with state["lock"]:
+            healthy = state["playlist"] is not None and not state["last_error"]
+        time.sleep(REFRESH_HOURS * 3600 if healthy else 600)
 
 
 # --- http ------------------------------------------------------------------------
