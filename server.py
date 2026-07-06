@@ -51,22 +51,23 @@ STREAM_EXT = os.environ.get("STREAM_EXT", "ts")
 PLAYLIST_STYLE = os.environ.get("PLAYLIST_STYLE", "native")  # native | ganja
 TEMPLATE_URL = os.environ.get("TEMPLATE_URL", "https://epgenius.org/api/public/manual")
 TEMPLATE_ID = int(os.environ.get("TEMPLATE_ID", "6"))
-TEMPLATE_EPG_URL = os.environ.get(
-    "TEMPLATE_EPG_URL",
-    "https://github.com/ferteque/Curated-M3U-Repository/raw/refs/heads/main/epg6.xml.gz")
+TEMPLATE_EPG_URL = os.environ.get("TEMPLATE_EPG_URL") or (
+    "https://github.com/ferteque/Curated-M3U-Repository/raw/refs/heads/main/"
+    f"epg{TEMPLATE_ID}.xml.gz")
 EPG_MERGE = os.environ.get("EPG_MERGE", "on") == "on"
 EPG_REFRESH_HOURS = float(os.environ.get("EPG_REFRESH_HOURS", "24"))
 # Base URL clients use to reach this server, for the playlist's url-tvg.
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
+# Category selection. All three default empty = keep every provider
+# category. INCLUDE_REGIONS filters by the prefix before the provider's
+# "❖" group separator and also sets region ordering.
 INCLUDE_REGIONS = [r.strip() for r in os.environ.get(
-    "INCLUDE_REGIONS", "US,VIP,UK,CA,AU,NZ,CAR,ALL").split(",") if r.strip()]
+    "INCLUDE_REGIONS", "").split(",") if r.strip()]
 EXCLUDE_GROUPS = [g.strip() for g in os.environ.get(
-    "EXCLUDE_GROUPS",
-    "CA ❖ QUEBEC,CAR ❖  CARAÏBES,VIP ❖ FIFA WC26 ES,VIP ❖ FIFA WC26 FR,"
-    "VIP ❖ FIFA WC26 AR,VIP ❖ BEIN SPORTS TOD").split(",") if g.strip()]
+    "EXCLUDE_GROUPS", "").split(",") if g.strip()]
 ONLY_GROUPS = [g.strip() for g in os.environ.get(
-    "ONLY_GROUPS", "CAR ❖ CARIBBEAN").split(",") if g.strip()]
+    "ONLY_GROUPS", "").split(",") if g.strip()]
 
 USER_AGENT = "playlist-server/2.0"
 PROVIDER_EPG_URL = f"{HOST}/xmltv.php?username={USERNAME}&password={PASSWORD}"
@@ -118,12 +119,17 @@ def keep_category(name):
     if name in EXCLUDE_GROUPS:
         return False
     reg = region_of(name)
-    if reg not in INCLUDE_REGIONS:
+    if INCLUDE_REGIONS and reg not in INCLUDE_REGIONS:
         return False
     only_in_region = [g for g in ONLY_GROUPS if region_of(g) == reg]
     if only_in_region and name not in only_in_region:
         return False
     return True
+
+
+def category_sort_key(name):
+    reg = region_of(name)
+    return INCLUDE_REGIONS.index(reg) if reg in INCLUDE_REGIONS else len(INCLUDE_REGIONS)
 
 
 def clean(value):
@@ -306,9 +312,13 @@ class Matcher:
 # --- template ----------------------------------------------------------------
 
 def fetch_template():
-    body = json.dumps({"id": TEMPLATE_ID}).encode()
-    with http_get(TEMPLATE_URL, timeout=120, data=body,
-                  headers={"Content-Type": "application/json"}) as resp:
+    if "/api/public/manual" in TEMPLATE_URL:
+        body = json.dumps({"id": TEMPLATE_ID}).encode()
+        resp = http_get(TEMPLATE_URL, timeout=120, data=body,
+                        headers={"Content-Type": "application/json"})
+    else:
+        resp = http_get(TEMPLATE_URL, timeout=120)
+    with resp:
         text = resp.read().decode("utf-8", errors="replace")
     if "#EXTM3U" not in text[:200]:
         raise RuntimeError("template response is not an M3U")
@@ -361,7 +371,7 @@ def epg_url_for_header():
 
 def build_native(categories, streams):
     kept = [c for c in categories if keep_category(c["category_name"])]
-    kept.sort(key=lambda c: INCLUDE_REGIONS.index(region_of(c["category_name"])))
+    kept.sort(key=lambda c: category_sort_key(c["category_name"]))
     by_cat = defaultdict(list)
     for s in streams:
         by_cat[str(s.get("category_id"))].append(s)
@@ -443,7 +453,7 @@ def build_ganja(categories, streams):
 
     # appendix: unmatched provider channels from the configured selection
     kept = [c for c in categories if keep_category(c["category_name"])]
-    kept.sort(key=lambda c: INCLUDE_REGIONS.index(region_of(c["category_name"])))
+    kept.sort(key=lambda c: category_sort_key(c["category_name"]))
     by_cat = defaultdict(list)
     for s in streams:
         by_cat[str(s.get("category_id"))].append(s)

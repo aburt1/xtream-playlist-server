@@ -1,91 +1,148 @@
 # xtream-playlist-server
 
-Small self-hosted service that builds an organized M3U playlist directly from
-an Xtream-API IPTV provider and serves it over HTTP. Point your IPTV app at
-one URL; the playlist regenerates itself from the provider's live channel
-database, so channel renumbering and lineup changes are picked up
-automatically.
+Self-hosted M3U playlist server for Xtream-API IPTV providers. Point your IPTV
+app (UHF, TiviMate, iPlayTV, ...) at one URL and get an auto-refreshing,
+quality-ranked playlist built straight from your provider's channel database —
+optionally styled to look like a curated EPGenius playlist, with a merged EPG
+that actually matches your channels.
 
-Useful when your provider's `get.php` M3U endpoint is disabled or when
-third-party curated playlists don't match your server cluster's channel IDs —
-this generates from `player_api.php`, which is the mapping your account
-actually plays.
+## Who this is for
 
-## Run
+Curated playlists like the ones on [EPGenius](https://epgenius.org) give IPTV
+that clean "cable guide" feel — organized groups, real channel names, logos,
+full EPG. But they hardcode **stream IDs from one specific provider server**.
+If your account lives on a different server cluster (very common — big
+providers run many), the curated playlist's IDs simply don't exist for you:
+you get 404s, dead channels, or the wrong channel entirely. Some providers
+also disable the `get.php` M3U endpoint, so curators can't even re-map for
+your server.
+
+This project fixes that from the other direction: it pulls **your** server's
+real channel list via `player_api.php` (which always works), then either
+serves it as-is (`native` mode) or re-creates the curated look on top of your
+real streams (`ganja` mode) by precision-matching every template entry to a
+channel your account can actually play.
+
+## What it does
+
+- **Auto-refresh** — rebuilds from the provider daily and whenever your app
+  reloads the playlist; a failed rebuild never replaces the last good copy.
+- **Styled mode** — takes any EPGenius template (or any M3U template URL) and
+  keeps its names, logos, groups, ordering, and separators, swapping every
+  stream URL for the matching stream on *your* server. Matching is
+  precision-first (EPG id, exact normalized name with region preference, US
+  local-affiliate network+city rules, broadcast callsigns) — never fuzzy, so
+  a styled channel is always the channel it claims to be. Unmatched entries
+  are dropped; your provider's remaining channels are appended in their own
+  groups so you lose nothing.
+- **Quality ranking** — when a channel exists in multiple feeds (SD/HD/FHD/
+  4K/8K), the best one is picked automatically (region-correct first).
+- **Multi-stream backups** — optionally emit the top N feeds per channel
+  under the same name; apps that group by name (UHF Smart Playlists) show
+  them as one channel with switchable backup sources.
+- **Merged EPG** — `/epg.xml` serves one filtered guide combining the
+  template's EPG and your provider's EPG, so both the styled section and the
+  appendix have data (gzip-encoded, ~20 MB instead of ~300).
+- **Explicit channel numbers** — every entry gets a sequential `tvg-chno`,
+  so apps that sort by number reproduce the intended order (curated
+  templates often ship broken `tvg-chno="null"` tags that scramble sorting).
+- **Token protection** — the playlist embeds your IPTV credentials (that's
+  how Xtream URLs work), so everything except `/status` can require
+  `?token=...`.
+
+## Quickstart (Docker)
 
 ```sh
-cp .env.example .env   # fill in your provider details
+git clone https://github.com/aburt1/xtream-playlist-server
+cd xtream-playlist-server
+cp .env.example .env    # fill in your provider details
 docker compose up -d --build
 ```
 
-On platforms like Coolify, deploy the repo with the Dockerfile build pack and
-set the environment variables in the UI instead of using a `.env` file.
+Then in your IPTV app:
 
-## URLs for your IPTV app
+- Playlist: `http://YOUR-SERVER:8080/playlist.m3u?token=YOUR_TOKEN`
+- EPG:      `http://YOUR-SERVER:8080/epg.xml?token=YOUR_TOKEN`
 
-- Playlist: `http://YOUR-SERVER:8080/playlist.m3u`
-- EPG:      `http://YOUR-SERVER:8080/epg.xml` (redirects to the provider's
-  guide; most apps also pick it up from the playlist header)
+## Deploying on Coolify (or similar)
 
-Extras:
+Create an app from this repo with the **Dockerfile** build pack, expose port
+8080, set your domain, and configure the environment variables in the UI
+instead of a `.env` file. Set `PUBLIC_BASE_URL` to your public domain so the
+playlist's built-in guide URL points at the merged EPG.
 
-- `/status` — last refresh time, channel count, errors
-- `/refresh` — force a rebuild now
+## Using an EPGenius template ("pop your list in")
 
-## Freshness
+1. Browse [epgenius.org](https://epgenius.org) → *Choose a Playlist* and find
+   a list curated for your provider brand. Note its **number** (e.g.
+   "6. GanjaRelease | Strong 8k" → `6`).
+2. Set `PLAYLIST_STYLE=ganja` and `TEMPLATE_ID=6`.
+3. That's it — the template M3U and its matching EPG
+   (`epg6.xml.gz`) are fetched automatically and re-fetched on every rebuild,
+   so template updates flow through.
 
-Two triggers keep the playlist current:
+Not on EPGenius? Point `TEMPLATE_URL` at any M3U you like (a plain GET URL)
+and `TEMPLATE_EPG_URL` at its guide; the same matching applies.
 
-1. A scheduled rebuild every `REFRESH_HOURS` (daily by default).
-2. Reloading the playlist in your IPTV app: if the cached copy is older than
-   `RELOAD_REFRESH_MINUTES`, the request rebuilds from the provider first,
-   waiting at most `RELOAD_WAIT_SECONDS` so the app never times out. If the
-   provider responds slowly, you get the previous copy now and the fresh one
-   on your next reload.
+How many channels match depends on how similar the template's source server
+is to yours — check `/status` (`styled` vs `appendix`) after the first build.
+Everything that doesn't match stays available in the appendix groups.
 
-A failed rebuild (provider down, etc.) never replaces the last good playlist.
+## Endpoints
 
-## Styled mode (curated look, your streams)
+| Path            | What it serves                                          |
+|-----------------|---------------------------------------------------------|
+| `/playlist.m3u` | The playlist (styled + appendix, or native)             |
+| `/epg.xml`      | Merged filtered XMLTV guide (gzip-encoded)              |
+| `/status`       | JSON: channel counts, refresh times, errors (no token)  |
+| `/refresh`      | Force a playlist rebuild now                            |
+| `/refresh-epg`  | Force an EPG re-merge now                               |
 
-Set `PLAYLIST_STYLE=ganja` to render the playlist in the look of a curated
-EPGenius template (channel names, logos, groups, ordering, EPG ids) while
-sourcing every stream from your own provider. Template entries are matched to
-provider streams with precision-first rules (EPG id, exact normalized name
-with region preference, US broadcast callsign) — never fuzzy matching, so a
-styled channel is always the channel it claims to be. Unmatched template
-entries are dropped; provider channels the template doesn't use are appended
-in their native groups.
+## Configuration
 
-With `EPG_MERGE=on` (default) and `PUBLIC_BASE_URL` set, `/epg.xml` serves a
-merged, filtered guide (template EPG + provider EPG, only referenced
-channels, gzip-encoded) so one guide URL covers the whole playlist.
+| Variable                 | Default          | Meaning                                            |
+|--------------------------|------------------|----------------------------------------------------|
+| `IPTV_HOST`              | required         | Provider base URL, no path                         |
+| `IPTV_USERNAME`          | required         | Xtream username                                    |
+| `IPTV_PASSWORD`          | required         | Xtream password                                    |
+| `TOKEN`                  | unset            | If set, all endpoints except `/status` need `?token=` |
+| `PLAYLIST_STYLE`         | `native`         | `native` or `ganja` (styled)                       |
+| `TEMPLATE_ID`            | `6`              | EPGenius playlist number                           |
+| `TEMPLATE_URL`           | EPGenius API     | Or any plain M3U URL                               |
+| `TEMPLATE_EPG_URL`       | derived from ID  | Guide matching the template                        |
+| `PUBLIC_BASE_URL`        | unset            | Public URL of this server (for the playlist's guide link) |
+| `EPG_MERGE`              | `on`             | Merged guide at `/epg.xml` (off = redirect to provider) |
+| `EPG_REFRESH_HOURS`      | `24`             | Guide re-merge interval                            |
+| `MULTI_STREAM`           | `off`            | Emit backup sources per styled channel             |
+| `MULTI_STREAM_MAX`       | `3`              | Max sources per channel                            |
+| `QUALITY_CAP`            | unset            | e.g. `fhd` to skip 4K/8K feeds                     |
+| `STREAM_EXT`             | `ts`             | `ts` or `m3u8` stream URLs                         |
+| `REFRESH_HOURS`          | `24`             | Scheduled playlist rebuild interval                |
+| `RELOAD_REFRESH_MINUTES` | `15`             | App reload older than this triggers a rebuild      |
+| `RELOAD_WAIT_SECONDS`    | `8`              | Max wait for that rebuild before serving last copy |
+| `INCLUDE_REGIONS`        | all              | Category prefixes to keep (before the `❖`), ordered |
+| `EXCLUDE_GROUPS`         | none             | Exact category names to skip                       |
+| `ONLY_GROUPS`            | none             | Per-region whitelist                               |
 
-Extra styled-mode variables: `PLAYLIST_STYLE`, `TEMPLATE_URL`, `TEMPLATE_ID`,
-`TEMPLATE_EPG_URL`, `EPG_MERGE`, `EPG_REFRESH_HOURS`, `PUBLIC_BASE_URL`.
+## App tips (UHF)
 
-## Configuration (environment variables)
+- Set channel sorting to **Relevance** (guide view → the up/down arrows next
+  to the times) so the curated order is respected.
+- Turn on **Smart Playlists** (Settings → User Interface) so multi-stream
+  backup sources group into one channel.
+- After the server redeploys, the merged guide takes a few minutes to build;
+  if your app cached an empty guide, trigger its EPG refresh once.
+- 24/7 loops, PPV slots, and event feeds have no schedule data anywhere —
+  "no information" on those is normal.
 
-| Variable                 | Default                     | Meaning                                    |
-|--------------------------|-----------------------------|--------------------------------------------|
-| `IPTV_HOST`              | required                    | Provider base URL, no path                 |
-| `IPTV_USERNAME`          | required                    | Xtream username                            |
-| `IPTV_PASSWORD`          | required                    | Xtream password                            |
-| `REFRESH_HOURS`          | `24`                        | Scheduled rebuild interval                 |
-| `RELOAD_REFRESH_MINUTES` | `15`                        | Playlist request older than this rebuilds  |
-| `RELOAD_WAIT_SECONDS`    | `8`                         | Max wait for that rebuild before serving the previous copy |
-| `TOKEN`                  | unset                       | If set, requests need `?token=...`         |
-| `STREAM_EXT`             | `ts`                        | `ts` or `m3u8` stream URLs                 |
-| `INCLUDE_REGIONS`        | `US,VIP,UK,CA,AU,NZ,CAR,ALL`| Category prefixes to include, ordered      |
-| `EXCLUDE_GROUPS`         | see `.env.example`          | Exact category names to skip               |
-| `ONLY_GROUPS`            | `CAR ❖ CARIBBEAN`           | Per-region whitelist (empty = whole region)|
+## Notes
 
-Group selection assumes the provider prefixes category names with a region
-code and `❖` separator (`US ❖ SPORTS`); adjust the variables to match your
-provider's naming.
+- One tiny dependency-free Python file; state is in memory plus a cached
+  guide file. Restarts rebuild everything from the provider.
+- This tool only reorganizes playlists for credentials you already have. It
+  does not provide, unlock, or proxy any content, and it phones home to
+  nobody.
 
-The generated playlist embeds your IPTV credentials — that's how Xtream
-stream URLs work. If the server is reachable from the internet, set `TOKEN`
-and use `/playlist.m3u?token=...` in your app.
+## License
 
-This tool only reorganizes a playlist for credentials you already have; it
-does not provide or unlock any content.
+MIT
